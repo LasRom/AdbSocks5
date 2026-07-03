@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:label="ADB SOCKS5 VPN"
+        android:supportsRtl="true">
+
+        <receiver
+            android:name=".AdbCommandReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.proxy.START" />
+                <action android:name="com.proxy.STOP" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".SocksVpnService"
+            android:exported="true"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="com.proxy.START" />
+                <action android:name="com.proxy.STOP" />
+            </intent-filter>
+
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Headless VpnService forwarding device traffic to a SOCKS5 proxy through tun2socks" />
+
+            <meta-data
+                android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"
+                android:value="false" />
+        </service>
+
+    </application>
+</manifest>
