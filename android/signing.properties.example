@@ -1,0 +1,7 @@
+# Copy this file to android/signing.properties and fill it locally.
+# android/signing.properties is ignored by Git and must not be committed.
+
+storeFile=../keystores/adbsocks5-release.jks
+storePassword=REPLACE_ME
+keyAlias=adbsocks5
+keyPassword=REPLACE_ME

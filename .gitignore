@@ -3,6 +3,8 @@
 .env.*
 !.env.example
 local.properties
+signing.properties
+keystores/
 *.keystore
 *.jks
 *.p12
