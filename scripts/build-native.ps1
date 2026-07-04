@@ -123,6 +123,32 @@ function Patch-HevSourceForLibraryBuild {
                 }
             }
         }
+
+    $miscSource = Join-Path $sourceRoot "src\core\src\hev-socks5-misc.c"
+    $misc = Get-Content -LiteralPath $miscSource -Raw
+    if ($misc -notmatch "hev_socks5_set_protect_socket") {
+        $misc = $misc.Replace(
+            '#include "hev-socks5-misc-priv.h"',
+            @'
+#include "hev-socks5-misc-priv.h"
+
+static int (*protect_socket_callback) (int fd);
+
+void
+hev_socks5_set_protect_socket (int (*callback) (int fd))
+{
+    protect_socket_callback = callback;
+}
+'@
+        )
+    }
+
+    if ($misc -notmatch "protect_socket_callback \(fd\)") {
+        $pattern = "(    if \(fd < 0\)\r?\n        return -1;\r?\n\r?\n)(    res = setsockopt \(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof \(zero\)\);)"
+        $replacement = "`$1    if (protect_socket_callback) {`r`n        res = protect_socket_callback (fd);`r`n        if (res < 0) {`r`n            close (fd);`r`n            return -1;`r`n        }`r`n    }`r`n`r`n`$2"
+        $misc = [regex]::Replace($misc, $pattern, $replacement, 1)
+    }
+    Set-Content -LiteralPath $miscSource -Value $misc -NoNewline
 }
 
 function Build-HevLibrary([string] $NdkBuild, [string] $TargetAbi) {
