@@ -1,0 +1,34 @@
+plugins {
+    id 'java-library'
+    id 'application'
+}
+
+group = 'com.adbsocks5'
+version = '0.1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(11)
+    }
+    withSourcesJar()
+}
+
+repositories {
+    mavenCentral()
+}
+
+// The SDK deliberately has no third-party runtime dependencies; it uses only
+// the JDK (ProcessBuilder + HttpURLConnection).
+dependencies {
+}
+
+application {
+    mainClass = 'com.adbsocks5.AdbSocks5Cli'
+    applicationName = 'adbsocks5'
+}
+
+tasks.named('jar') {
+    manifest {
+        attributes('Main-Class': 'com.adbsocks5.AdbSocks5Cli')
+    }
+}
