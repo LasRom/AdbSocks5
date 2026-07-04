@@ -14,6 +14,7 @@ The app has no Activity and no UI. It is meant to be controlled by scripts, SDKs
 - Native `hev-socks5-tunnel` through JNI
 - SOCKS5 preflight before VPN startup
 - Packaged native ABIs: `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`
+- Python and Java SDKs for ADB control (`sdk/python`, `sdk/java`)
 
 ## Requirements
 
@@ -227,6 +228,28 @@ Internet works without VPN but not with VPN:
 - check `cache/tun2socks.log` on debug builds;
 - stop the VPN and retry with a known working proxy.
 
+## SDKs
+
+Language SDKs wrap the ADB control surface so you can install, start, stop, and
+configure the proxy programmatically. Both let you target a specific device by
+its ADB serial and download+install the APK automatically when it is missing.
+
+- Python SDK: [`sdk/python`](sdk/python) — package `adbsocks5`, standard library only.
+
+  ```bash
+  cd sdk/python && pip install -e .
+  adbsocks5 connect --serial ABCD1234 --ip 1.2.3.4 --port 1080 --login user --password pass
+  ```
+
+- Java SDK: [`sdk/java`](sdk/java) — package `com.adbsocks5`, pure JDK (no dependencies).
+
+  ```bash
+  cd sdk/java && javac -d out src/main/java/com/adbsocks5/*.java
+  java -cp out com.adbsocks5.AdbSocks5Cli connect --serial ABCD1234 --ip 1.2.3.4 --port 1080 --login user --password pass
+  ```
+
+See each SDK's `README.md` for the full API and CLI reference.
+
 ## Repository Layout
 
 ```text
@@ -234,9 +257,9 @@ Internet works without VPN but not with VPN:
 |-- android/          # Android Gradle project and APK module
 |   `-- app/          # Headless Android application
 |-- scripts/          # Build helpers, including native library build
-|-- sdk/              # Future language SDKs
-|   |-- python/       # Python SDK placeholder
-|   `-- java/         # Java SDK placeholder
+|-- sdk/              # Language SDKs for controlling the app over ADB
+|   |-- python/       # Python SDK (adbsocks5)
+|   `-- java/         # Java SDK (com.adbsocks5)
 `-- README.md         # Public install/use documentation
 ```
 
@@ -251,8 +274,13 @@ Local AI/project memory files are intentionally not part of the public repositor
 ## Roadmap
 
 - Add CI checks for APK and native ABI matrix builds.
-- Build Python SDK for ADB install/start/stop/config workflows.
-- Build Java SDK with the same control surface.
+- Package and publish the SDKs (PyPI / Maven).
+- Add SDK integration tests against a connected device.
+
+Done:
+
+- Python SDK for ADB install/start/stop/config workflows (`sdk/python`).
+- Java SDK with the same control surface (`sdk/java`).
 
 ## License
 
