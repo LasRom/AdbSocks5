@@ -252,7 +252,8 @@ class SocksVpnService : VpnService() {
     private fun handleStartIntent(intent: Intent): Boolean {
         Log.d(TAG, "handleStartIntent: START action received")
 
-        val proxyConfig = parseProxyConfig(intent.getStringExtra(EXTRA_CONFIG))
+        val udpMode = parseUdpMode(intent.getStringExtra(EXTRA_UDP_MODE))
+        val proxyConfig = parseProxyConfig(intent.getStringExtra(EXTRA_CONFIG), udpMode)
         if (proxyConfig == null) {
             Log.e(TAG, "handleStartIntent: config parsing failed")
             stopServiceAfterFailure()
@@ -630,7 +631,7 @@ class SocksVpnService : VpnService() {
             socks5:
               address: '${yamlSingleQuoted(config.ip)}'
               port: ${config.port}
-              udp: 'tcp'
+              udp: '${config.udpMode}'
 $authConfig
             mapdns:
               address: '$MAPDNS_ADDRESS'
@@ -697,6 +698,19 @@ $authConfig
             Tun2Socks.stop()
             Log.d(TAG, "stopVpn: interrupting worker name=${worker.name} alive=${worker.isAlive}")
             worker.interrupt()
+            // Wait for the native tunnel loop to actually exit before we close
+            // the VPN fd or establish a new interface. Without this, a quick
+            // reconnect (proxy hot-swap) races the old worker and the fresh
+            // tunnel comes up on a half-torn-down state -> "Connection refused".
+            if (worker !== Thread.currentThread()) {
+                try {
+                    worker.join(WORKER_JOIN_TIMEOUT_MS)
+                } catch (exception: InterruptedException) {
+                    Log.e(TAG, "stopVpn: interrupted while waiting for worker to finish", exception)
+                    Thread.currentThread().interrupt()
+                }
+            }
+            Log.d(TAG, "stopVpn: worker join complete alive=${worker.isAlive}")
         } else {
             Log.d(TAG, "stopVpn: no tun2socks worker to interrupt")
         }
@@ -722,7 +736,7 @@ $authConfig
         stopSelf()
     }
 
-    private fun parseProxyConfig(rawConfig: String?): ProxyConfig? {
+    private fun parseProxyConfig(rawConfig: String?, udpMode: String): ProxyConfig? {
         Log.d(TAG, "parseProxyConfig: raw config extra=${redactConfig(rawConfig)}")
 
         if (rawConfig == null) {
@@ -754,9 +768,31 @@ $authConfig
         Log.d(
             TAG,
             "parseProxyConfig: parsed ip=$ip port=$port auth=${login.isNotEmpty() || password.isNotEmpty()} " +
-                "passwordLength=${password.length}"
+                "passwordLength=${password.length} udp=$udpMode"
         )
-        return ProxyConfig(ip, port, login, password)
+        return ProxyConfig(ip, port, login, password, udpMode)
+    }
+
+    private fun parseUdpMode(rawUdpMode: String?): String {
+        val requested = rawUdpMode?.trim()?.lowercase()
+        return when {
+            requested.isNullOrEmpty() -> {
+                Log.d(TAG, "parseUdpMode: no udp extra, using default=$DEFAULT_UDP_MODE")
+                DEFAULT_UDP_MODE
+            }
+            requested in ALLOWED_UDP_MODES -> {
+                Log.d(TAG, "parseUdpMode: using udp mode=$requested")
+                requested
+            }
+            else -> {
+                Log.e(
+                    TAG,
+                    "parseUdpMode: unsupported udp mode=$requested, falling back to " +
+                        "$DEFAULT_UDP_MODE (allowed: $ALLOWED_UDP_MODES)"
+                )
+                DEFAULT_UDP_MODE
+            }
+        }
     }
 
     private fun promoteToForeground(statusText: String) {
@@ -848,7 +884,8 @@ $authConfig
         val ip: String,
         val port: Int,
         val login: String,
-        val password: String
+        val password: String,
+        val udpMode: String
     ) {
         val hasAuth: Boolean
             get() = login.isNotEmpty() || password.isNotEmpty()
@@ -870,6 +907,7 @@ $authConfig
         const val ACTION_STOP = "com.proxy.STOP"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_ALLOWED_PACKAGE = "allowedPackage"
+        const val EXTRA_UDP_MODE = "udp"
         @Volatile internal var activeService: SocksVpnService? = null
 
         private const val TAG = "SocksVpnService"
@@ -882,6 +920,16 @@ $authConfig
         private const val TUN_IPV4_PREFIX_LENGTH = 32
         private const val TUN2SOCKS_LOG_FILE_NAME = "tun2socks.log"
         private const val TUN2SOCKS_LOG_TAIL_LINES = 120
+
+        // SOCKS5 UDP relay mode passed to hev-socks5-tunnel:
+        //   'udp' -> standard RFC 1928 UDP ASSOCIATE (works with normal proxies;
+        //            if the proxy has no UDP, UDP just fails while TCP is fine)
+        //   'tcp' -> hev's non-standard UDP-in-TCP (only hev-socks5-server).
+        // Default is 'udp' so ordinary commercial SOCKS5 proxies do not receive
+        // non-standard framing and reset the whole connection.
+        private const val DEFAULT_UDP_MODE = "udp"
+        private val ALLOWED_UDP_MODES = setOf("udp", "tcp")
+        private const val WORKER_JOIN_TIMEOUT_MS = 3000L
 
         private const val MAPDNS_ADDRESS = "198.18.0.2"
         private const val MAPDNS_NETWORK = "100.64.0.0"
