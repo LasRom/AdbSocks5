@@ -154,7 +154,7 @@ hev_socks5_set_protect_socket (int (*callback) (int fd))
     $tunnel = Get-Content -LiteralPath $tunnelSource -Raw
     if ($tunnel -notmatch "ADB SOCKS5: drop non-DNS UDP") {
         $pattern = "(    dns = hev_mapped_dns_get \(\);\r?\n    if \(dns && addr->type == IPADDR_TYPE_V4\) \{\r?\n        int faddr = hev_config_get_mapdns_address \(\);\r?\n        int fport = hev_config_get_mapdns_port \(\);\r?\n        if \(fport == port && faddr == ip_2_ip4 \(addr\)->addr\) \{\r?\n            udp_recv \(pcb, dns_recv_handler, dns\);\r?\n            return;\r?\n        \}\r?\n    \}\r?\n\r?\n)(    udp = hev_socks5_session_udp_new \(pcb, &mutex\);)"
-        $replacement = "`$1    /* ADB SOCKS5: SocksDroid-style default. Keep DNS on mapdns, but`r`n     * do not send arbitrary full-device UDP through commercial SOCKS5.`r`n     * It otherwise opens many UDP ASSOCIATE sessions and starves TCP.`r`n     */`r`n    if (p)`r`n        pbuf_free (p);`r`n    udp_remove (pcb);`r`n    return;`r`n`r`n`$2"
+        $replacement = "`$1    /* ADB SOCKS5: SocksDroid-style default. Keep DNS on mapdns, but`r`n     * do not send arbitrary full-device UDP through commercial SOCKS5.`r`n     * It otherwise opens many UDP ASSOCIATE sessions and starves TCP.`r`n     *`r`n     * Do NOT pbuf_free (p) here: like the !run branch above, udp_input`r`n     * owns and frees p after this callback returns. Freeing it here is a`r`n     * double-free that aborts under real full-device UDP load.`r`n     */`r`n    udp_remove (pcb);`r`n    return;`r`n`r`n`$2"
         $patchedTunnel = [regex]::Replace($tunnel, $pattern, $replacement, 1)
         if ($patchedTunnel -eq $tunnel) {
             throw "Failed to patch hev-socks5-tunnel UDP handler"
