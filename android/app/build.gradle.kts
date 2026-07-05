@@ -75,6 +75,14 @@ android {
         }
     }
 
+    packaging {
+        jniLibs {
+            // The tunnel engine ships native executables (tun2socks, pdnsd)
+            // packaged as lib*.so; they must be extracted to disk to be exec'd.
+            useLegacyPackaging = true
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

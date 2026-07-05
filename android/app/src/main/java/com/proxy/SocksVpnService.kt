@@ -7,19 +7,17 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.util.Log
-import java.io.EOFException
 import java.io.File
 import java.io.IOException
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
 class AdbCommandReceiver : BroadcastReceiver() {
@@ -188,18 +186,36 @@ class AdbCommandService : Service() {
     }
 }
 
+/**
+ * VpnService that routes device traffic to a SOCKS5 proxy using the SocksDroid
+ * engine model: BadVPN tun2socks (a separate native process that receives the
+ * TUN fd over a unix socket) plus pdnsd (resolves DNS over TCP through the
+ * proxy). No SOCKS5 preflight — the tunnel is established immediately. Runs in
+ * its own ":tunnel" process (see manifest); killed on STOP for a clean restart.
+ */
 class SocksVpnService : VpnService() {
 
-    private var vpnFileDescriptor: ParcelFileDescriptor? = null
-    @Volatile private var tun2SocksThread: Thread? = null
+    @Volatile private var vpnFileDescriptor: ParcelFileDescriptor? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val startGeneration = AtomicInteger(0)
+
+    // Answers a QUERY_STATE from the UI (which lives in a different process and
+    // cannot read our static state) by re-broadcasting the current state.
+    private val queryStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == ACTION_QUERY_STATE) {
+                Log.d(TAG, "queryStateReceiver: re-broadcasting state=$currentState")
+                broadcastState(currentState, currentStateDetail)
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         activeService = this
         Log.d(TAG, "onCreate: service created")
         createNotificationChannel()
+        registerQueryStateReceiver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -209,12 +225,13 @@ class SocksVpnService : VpnService() {
 
         if (intent == null) {
             Log.e(TAG, "onStartCommand: intent is null, stopping service")
-            stopServiceAfterFailure()
+            stopServiceAfterFailure("no intent")
             return START_NOT_STICKY
         }
 
         return when (intent.action) {
             ACTION_START -> {
+                cancelTunnelProcessKill()
                 val started = handleStartIntent(intent)
                 if (started) START_REDELIVER_INTENT else START_NOT_STICKY
             }
@@ -222,13 +239,15 @@ class SocksVpnService : VpnService() {
                 Log.d(TAG, "onStartCommand: STOP action received")
                 startGeneration.incrementAndGet()
                 stopVpn()
+                broadcastState(STATE_STOPPED)
                 stopForegroundCompat()
                 stopSelf()
+                scheduleTunnelProcessKill()
                 START_NOT_STICKY
             }
             else -> {
                 Log.e(TAG, "onStartCommand: unsupported action=${intent.action}")
-                stopServiceAfterFailure()
+                stopServiceAfterFailure("unsupported action")
                 START_NOT_STICKY
             }
         }
@@ -240,13 +259,55 @@ class SocksVpnService : VpnService() {
         if (activeService === this) {
             activeService = null
         }
+        try {
+            unregisterReceiver(queryStateReceiver)
+        } catch (_: IllegalArgumentException) {
+            // Not registered; ignore.
+        }
         super.onDestroy()
     }
 
     override fun onRevoke() {
         Log.e(TAG, "onRevoke: VPN permission revoked by the system or user")
         stopVpn()
+        broadcastState(STATE_STOPPED, "VPN revoked")
+        scheduleTunnelProcessKill()
         super.onRevoke()
+    }
+
+    private fun registerQueryStateReceiver() {
+        val filter = IntentFilter(ACTION_QUERY_STATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(queryStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(queryStateReceiver, filter)
+        }
+    }
+
+    /**
+     * The tunnel runs in its own ":tunnel" process (see manifest). After a
+     * user-initiated teardown we kill that process so the next START comes up in
+     * a fresh process. The native daemons (tun2socks, pdnsd) daemonize and
+     * reparent away, so killing this process does not stop them — they are
+     * stopped explicitly by pid file in stopVpn(). The UI lives in the main
+     * process and is unaffected. Delayed slightly so the STATE broadcast and
+     * foreground notification removal are dispatched first.
+     */
+    private val killProcessRunnable = Runnable {
+        Log.d(TAG, "killProcessRunnable: killing :tunnel process pid=${Process.myPid()}")
+        Process.killProcess(Process.myPid())
+    }
+
+    private fun scheduleTunnelProcessKill() {
+        mainHandler.removeCallbacks(killProcessRunnable)
+        mainHandler.postDelayed(killProcessRunnable, PROCESS_KILL_DELAY_MS)
+    }
+
+    private fun cancelTunnelProcessKill() {
+        // A new START arrived before the delayed kill fired (rapid reconnect in
+        // the same process). Do not kill a process that is now connecting.
+        mainHandler.removeCallbacks(killProcessRunnable)
     }
 
     private fun handleStartIntent(intent: Intent): Boolean {
@@ -255,7 +316,7 @@ class SocksVpnService : VpnService() {
         val proxyConfig = parseProxyConfig(intent.getStringExtra(EXTRA_CONFIG))
         if (proxyConfig == null) {
             Log.e(TAG, "handleStartIntent: config parsing failed")
-            stopServiceAfterFailure()
+            stopServiceAfterFailure("invalid config")
             return false
         }
 
@@ -263,449 +324,238 @@ class SocksVpnService : VpnService() {
         if (consentIntent != null) {
             Log.e(
                 TAG,
-                "handleStartIntent: VPN is not prepared. This headless app has no Activity " +
-                    "to show the consent dialog; grant VPN consent before starting from ADB."
+                "handleStartIntent: VPN is not prepared. Grant VPN consent (via the UI or " +
+                    "`appops set com.proxy ACTIVATE_VPN allow`) before starting from ADB."
             )
-            stopServiceAfterFailure()
+            stopServiceAfterFailure("VPN consent not granted")
             return false
         }
-        Log.d(TAG, "handleStartIntent: VpnService.prepare returned null, VPN permission is ready")
 
         val allowedPackage = parseAllowedPackage(intent.getStringExtra(EXTRA_ALLOWED_PACKAGE))
+        val udpgw = intent.getStringExtra(EXTRA_UDPGW)?.trim()?.takeIf { it.isNotEmpty() }
         val generation = startGeneration.incrementAndGet()
-        promoteToForeground("Checking SOCKS5 proxy")
-        runPreflightThenStart(proxyConfig, allowedPackage, generation)
+
+        promoteToForeground("Connecting to ${proxyConfig.ip}:${proxyConfig.port}")
+        broadcastState(STATE_CONNECTING, "${proxyConfig.ip}:${proxyConfig.port}")
+        startTunnel(proxyConfig, allowedPackage, udpgw, generation)
         return true
     }
 
-    private fun runPreflightThenStart(
+    private fun startTunnel(
         config: ProxyConfig,
         allowedPackage: String?,
+        udpgw: String?,
         generation: Int
     ) {
+        // Off the main thread: establish + exec daemons + hand over the tun fd
+        // (the fd handover retries with backoff and must not block the UI/ANR).
         val worker = Thread({
-            Log.d(TAG, "runPreflightThenStart: preflight worker started generation=$generation")
-            val result = runSocks5Preflight(config)
-            mainHandler.post {
+            try {
+                stopTunnelProcesses()
+
+                Log.d(TAG, "startTunnel: establishing TUN interface")
+                val tunInterface = establishTunInterface(allowedPackage)
+
+                // Only publish the descriptor once we know this start is current.
+                // A superseded (stale) worker must close its OWN local interface,
+                // never the shared field — otherwise it could close the winning
+                // worker's live fd (and racing raw closes trip fdsan).
                 if (generation != startGeneration.get()) {
-                    Log.d(
-                        TAG,
-                        "runPreflightThenStart: ignoring stale preflight result generation=$generation"
-                    )
-                    return@post
+                    Log.d(TAG, "startTunnel: stale generation=$generation, closing own tun")
+                    try {
+                        tunInterface.close()
+                    } catch (exception: IOException) {
+                        Log.e(TAG, "startTunnel: failed to close stale tun", exception)
+                    }
+                    return@Thread
                 }
 
-                if (!result.success) {
-                    Log.e(
-                        TAG,
-                        "runPreflightThenStart: SOCKS5 preflight failed " +
-                            "stage=${result.stage} message=${result.message}"
-                    )
-                    stopServiceAfterFailure()
-                    return@post
+                vpnFileDescriptor = tunInterface
+                val fd = tunInterface.fd
+                Log.d(TAG, "startTunnel: VPN established fd=$fd")
+
+                writePdnsdConf()
+                startPdnsd()
+                val rc = startTun2Socks(config, fd, udpgw)
+                if (rc != 0) {
+                    throw IOException("tun2socks exec returned $rc")
                 }
 
-                Log.d(
-                    TAG,
-                        "runPreflightThenStart: SOCKS5 preflight passed " +
-                            "stage=${result.stage} message=${result.message}"
-                )
-                startVpnAfterPreflight(config, allowedPackage)
+                if (!sendTunFd(fd)) {
+                    throw IOException("failed to hand TUN fd to tun2socks")
+                }
+
+                mainHandler.post {
+                    if (generation != startGeneration.get()) {
+                        Log.d(TAG, "startTunnel: stale generation after handover, ignoring")
+                        return@post
+                    }
+                    promoteToForeground("Connected to ${config.ip}:${config.port}")
+                    broadcastState(STATE_CONNECTED, "${config.ip}:${config.port}")
+                    Log.d(TAG, "startTunnel: tunnel up for ${config.ip}:${config.port}")
+                }
+            } catch (throwable: Throwable) {
+                Log.e(TAG, "startTunnel: failed to start tunnel", throwable)
+                mainHandler.post {
+                    if (generation == startGeneration.get()) {
+                        stopServiceAfterFailure(throwable.message ?: "tunnel start failed")
+                    }
+                }
             }
-        }, "socks5-preflight")
-
+        }, "tunnel-start")
         worker.start()
     }
-
-    private fun startVpnAfterPreflight(proxyConfig: ProxyConfig, allowedPackage: String?) {
-        try {
-            Log.d(TAG, "startVpnAfterPreflight: stopping previous VPN instance if any")
-            stopVpn()
-
-            Log.d(TAG, "startVpnAfterPreflight: establishing TUN interface")
-            val tunInterface = establishTunInterface(allowedPackage)
-            vpnFileDescriptor = tunInterface
-            Log.d(TAG, "startVpnAfterPreflight: VPN established, fd=${tunInterface.fd}")
-
-            startTun2Socks(tunInterface, proxyConfig)
-            promoteToForeground("Connected to ${proxyConfig.ip}:${proxyConfig.port}")
-
-            Log.d(TAG, "startVpnAfterPreflight: SOCKS5 VPN startup completed")
-        } catch (throwable: Throwable) {
-            Log.e(TAG, "startVpnAfterPreflight: failed to start VPN", throwable)
-            stopServiceAfterFailure()
-        }
-    }
-
-    private fun runSocks5Preflight(config: ProxyConfig): PreflightResult {
-        Log.d(
-            TAG,
-            "runSocks5Preflight: checking proxy ip=${config.ip} port=${config.port} " +
-                "auth=${config.hasAuth}"
-        )
-
-        return try {
-            Socket().use { socket ->
-                socket.tcpNoDelay = true
-                socket.soTimeout = PREFLIGHT_READ_TIMEOUT_MS
-                socket.connect(
-                    InetSocketAddress(config.ip, config.port),
-                    PREFLIGHT_CONNECT_TIMEOUT_MS
-                )
-
-                val input = socket.getInputStream()
-                val output = socket.getOutputStream()
-                val method = if (config.hasAuth) SOCKS5_METHOD_USER_PASS else SOCKS5_METHOD_NO_AUTH
-
-                output.write(byteArrayOf(SOCKS5_VERSION, 1, method))
-                output.flush()
-
-                val methodResponse = readFully(input, 2)
-                if (methodResponse[0] != SOCKS5_VERSION) {
-                    return PreflightResult.fail(
-                        "handshake",
-                        "unexpected SOCKS version=${methodResponse[0].toUnsignedInt()}"
-                    )
-                }
-
-                val selectedMethod = methodResponse[1]
-                if (selectedMethod == SOCKS5_METHOD_NOT_ACCEPTABLE) {
-                    return PreflightResult.fail("handshake", "proxy rejected offered auth methods")
-                }
-
-                if (selectedMethod == SOCKS5_METHOD_USER_PASS) {
-                    val authFailure = authenticateSocks5(config, input, output)
-                    if (authFailure != null) return authFailure
-                } else if (selectedMethod != SOCKS5_METHOD_NO_AUTH) {
-                    return PreflightResult.fail(
-                        "handshake",
-                        "unsupported auth method=${selectedMethod.toUnsignedInt()}"
-                    )
-                }
-
-                val targetHostBytes = PREFLIGHT_TARGET_HOST.toByteArray(Charsets.UTF_8)
-                if (targetHostBytes.size > 255) {
-                    return PreflightResult.fail("connect", "target host is too long")
-                }
-
-                output.write(
-                    byteArrayOf(
-                        SOCKS5_VERSION,
-                        SOCKS5_COMMAND_CONNECT,
-                        0,
-                        SOCKS5_ADDRESS_DOMAIN,
-                        targetHostBytes.size.toByte()
-                    )
-                )
-                output.write(targetHostBytes)
-                output.write(
-                    byteArrayOf(
-                        (PREFLIGHT_TARGET_PORT shr 8).toByte(),
-                        (PREFLIGHT_TARGET_PORT and 0xff).toByte()
-                    )
-                )
-                output.flush()
-
-                val connectResponse = readFully(input, 4)
-                if (connectResponse[0] != SOCKS5_VERSION) {
-                    return PreflightResult.fail(
-                        "connect",
-                        "unexpected CONNECT response version=${connectResponse[0].toUnsignedInt()}"
-                    )
-                }
-
-                val reply = connectResponse[1]
-                if (reply != SOCKS5_REPLY_SUCCESS) {
-                    return PreflightResult.fail(
-                        "connect",
-                        "proxy CONNECT failed reply=${reply.toUnsignedInt()} ${socks5ReplyName(reply)}"
-                    )
-                }
-
-                drainSocks5BindAddress(input, connectResponse[3])
-
-                val request = (
-                    "GET / HTTP/1.1\r\n" +
-                        "Host: $PREFLIGHT_TARGET_HOST\r\n" +
-                        "Connection: close\r\n" +
-                        "\r\n"
-                    ).toByteArray(Charsets.US_ASCII)
-                output.write(request)
-                output.flush()
-
-                val firstByte = input.read()
-                if (firstByte < 0) {
-                    return PreflightResult.fail("http", "proxy closed connection before HTTP response")
-                }
-
-                PreflightResult.ok(
-                    "http",
-                    "proxy returned HTTP data from $PREFLIGHT_TARGET_HOST:$PREFLIGHT_TARGET_PORT"
-                )
-            }
-        } catch (exception: SocketTimeoutException) {
-            PreflightResult.fail("network", "timeout: ${exception.message ?: exception.javaClass.simpleName}")
-        } catch (exception: IOException) {
-            PreflightResult.fail("network", exception.message ?: exception.javaClass.simpleName)
-        } catch (exception: RuntimeException) {
-            PreflightResult.fail("network", exception.message ?: exception.javaClass.simpleName)
-        }
-    }
-
-    private fun authenticateSocks5(
-        config: ProxyConfig,
-        input: java.io.InputStream,
-        output: java.io.OutputStream
-    ): PreflightResult? {
-        val usernameBytes = config.login.toByteArray(Charsets.UTF_8)
-        val passwordBytes = config.password.toByteArray(Charsets.UTF_8)
-        if (usernameBytes.size > 255 || passwordBytes.size > 255) {
-            return PreflightResult.fail("auth", "username/password is too long for SOCKS5 auth")
-        }
-
-        output.write(byteArrayOf(SOCKS5_AUTH_VERSION, usernameBytes.size.toByte()))
-        output.write(usernameBytes)
-        output.write(passwordBytes.size)
-        output.write(passwordBytes)
-        output.flush()
-
-        val authResponse = readFully(input, 2)
-        if (authResponse[0] != SOCKS5_AUTH_VERSION) {
-            return PreflightResult.fail(
-                "auth",
-                "unexpected auth version=${authResponse[0].toUnsignedInt()}"
-            )
-        }
-        if (authResponse[1] != SOCKS5_AUTH_SUCCESS) {
-            return PreflightResult.fail(
-                "auth",
-                "proxy auth failed status=${authResponse[1].toUnsignedInt()}"
-            )
-        }
-
-        return null
-    }
-
-    private fun readFully(input: java.io.InputStream, size: Int): ByteArray {
-        val buffer = ByteArray(size)
-        var offset = 0
-        while (offset < size) {
-            val read = input.read(buffer, offset, size - offset)
-            if (read < 0) throw EOFException("unexpected EOF")
-            offset += read
-        }
-        return buffer
-    }
-
-    private fun drainSocks5BindAddress(input: java.io.InputStream, addressType: Byte) {
-        val addressLength = when (addressType) {
-            SOCKS5_ADDRESS_IPV4 -> 4
-            SOCKS5_ADDRESS_IPV6 -> 16
-            SOCKS5_ADDRESS_DOMAIN -> readFully(input, 1)[0].toUnsignedInt()
-            else -> throw IOException("unsupported BND.ADDR type=${addressType.toUnsignedInt()}")
-        }
-        readFully(input, addressLength + 2)
-    }
-
-    private fun socks5ReplyName(reply: Byte): String {
-        return when (reply.toUnsignedInt()) {
-            1 -> "general failure"
-            2 -> "connection not allowed"
-            3 -> "network unreachable"
-            4 -> "host unreachable"
-            5 -> "connection refused"
-            6 -> "TTL expired"
-            7 -> "command not supported"
-            8 -> "address type not supported"
-            else -> "unknown"
-        }
-    }
-
-    private fun Byte.toUnsignedInt(): Int = toInt() and 0xff
 
     private fun establishTunInterface(allowedPackage: String?): ParcelFileDescriptor {
         val builder = Builder()
             .setSession(VPN_SESSION_NAME)
             .setMtu(TUN_MTU)
-            .addAddress(TUN_IPV4_ADDRESS, TUN_IPV4_PREFIX_LENGTH)
+            .addAddress(TUN_ADDRESS, TUN_PREFIX_LENGTH)
             .addRoute("0.0.0.0", 0)
-            .addDnsServer(MAPDNS_ADDRESS)
-            .setBlocking(true)
+            .addRoute(DNS_STUB, 32)
+            .addDnsServer(DNS_STUB)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            Log.d(TAG, "establishTunInterface: marking VPN as not metered")
             builder.setMetered(false)
         }
 
         if (allowedPackage != null) {
-            try {
-                Log.d(TAG, "establishTunInterface: allowing only package=$allowedPackage")
-                builder.addAllowedApplication(allowedPackage)
-            } catch (exception: Exception) {
-                Log.e(TAG, "establishTunInterface: failed to allow package=$allowedPackage", exception)
-                throw exception
-            }
+            Log.d(TAG, "establishTunInterface: allowing only package=$allowedPackage")
+            builder.addAllowedApplication(allowedPackage)
         } else {
+            // Full-device: bypass our own UID so tun2socks/pdnsd upstream sockets
+            // do not loop back into the tunnel (SocksDroid does exactly this).
             try {
-                Log.d(TAG, "establishTunInterface: excluding own package from VPN to avoid proxy loop")
+                Log.d(TAG, "establishTunInterface: excluding own package to avoid proxy loop")
                 builder.addDisallowedApplication(packageName)
             } catch (exception: Exception) {
-                Log.e(TAG, "establishTunInterface: failed to exclude own package=$packageName", exception)
+                Log.e(TAG, "establishTunInterface: failed to exclude own package", exception)
             }
         }
 
         Log.d(
             TAG,
-            "establishTunInterface: builder configured address=$TUN_IPV4_ADDRESS/$TUN_IPV4_PREFIX_LENGTH " +
-                "route=0.0.0.0/0 dns=$MAPDNS_ADDRESS mtu=$TUN_MTU allowedPackage=$allowedPackage"
+            "establishTunInterface: address=$TUN_ADDRESS/$TUN_PREFIX_LENGTH route=0.0.0.0/0 " +
+                "dns=$DNS_STUB mtu=$TUN_MTU allowedPackage=$allowedPackage"
         )
 
         return builder.establish()
             ?: throw IllegalStateException("VpnService.Builder.establish returned null")
     }
 
-    private fun startTun2Socks(vpnFileDescriptor: ParcelFileDescriptor, config: ProxyConfig) {
-        Log.d(
-            TAG,
-            "startTun2Socks: preparing worker for ip=${config.ip} port=${config.port} " +
-                "auth=${config.hasAuth} passwordLength=${config.password.length}"
+    private fun startPdnsd() {
+        val cmd = arrayOf(
+            "${applicationInfo.nativeLibraryDir}/$LIB_PDNSD",
+            "-c",
+            "${filesDir}/pdnsd.conf"
         )
+        Log.d(TAG, "startPdnsd: ${cmd.joinToString(" ")}")
+        val rc = execAndWait(cmd)
+        // pdnsd daemonizes (daemon=on); a non-zero here is logged but DNS failure
+        // is not fatal to the TCP tunnel.
+        Log.d(TAG, "startPdnsd: exit=$rc")
+    }
 
-        val tun2SocksLogFile = prepareTun2SocksLogFile()
-        val tun2SocksConfig = buildTun2SocksConfig(config, tun2SocksLogFile)
-        val worker = Thread({
-            Log.d(TAG, "Tun2Socks worker: started")
+    private fun startTun2Socks(config: ProxyConfig, fd: Int, udpgw: String?): Int {
+        val command = ArrayList<String>()
+        command.add("${applicationInfo.nativeLibraryDir}/$LIB_TUN2SOCKS")
+        command.add("--netif-ipaddr"); command.add(TUN_NETIF_IPADDR)
+        command.add("--netif-netmask"); command.add(TUN_NETIF_NETMASK)
+        command.add("--socks-server-addr"); command.add("${config.ip}:${config.port}")
+        command.add("--tunfd"); command.add(fd.toString())
+        command.add("--tunmtu"); command.add(TUN_MTU.toString())
+        command.add("--loglevel"); command.add("3")
+        command.add("--pid"); command.add("${filesDir}/tun2socks.pid")
+        command.add("--sock"); command.add("${applicationInfo.dataDir}/sock_path")
+        if (config.hasAuth) {
+            command.add("--username"); command.add(config.login)
+            command.add("--password"); command.add(config.password)
+        }
+        command.add("--dnsgw"); command.add(DNSGW)
+        if (udpgw != null) {
+            command.add("--udpgw-remote-server-addr"); command.add(udpgw)
+        }
+
+        Log.d(TAG, "startTun2Socks: launching tun2socks (server=${config.ip}:${config.port} auth=${config.hasAuth})")
+        return execAndWait(command.toTypedArray())
+    }
+
+    private fun sendTunFd(fd: Int): Boolean {
+        val sockPath = "${applicationInfo.dataDir}/sock_path"
+        for (attempt in 1..FD_SEND_ATTEMPTS) {
+            if (Native.sendfd(fd, sockPath) != -1) {
+                Log.d(TAG, "sendTunFd: handed fd=$fd to tun2socks on attempt=$attempt")
+                return true
+            }
+            Log.d(TAG, "sendTunFd: attempt=$attempt failed, retrying")
             try {
-                Log.d(TAG, "Tun2Socks worker: calling Tun2Socks.start(vpnFileDescriptor, config)")
-
-                Tun2Socks.start(
-                    vpnFileDescriptor,
-                    tun2SocksConfig
-                )
-
-                Log.d(TAG, "Tun2Socks worker: Tun2Socks.start returned normally")
-            } catch (throwable: Throwable) {
-                Log.e(TAG, "Tun2Socks worker: Tun2Socks.start failed", throwable)
-                val failedThread = Thread.currentThread()
-                if (failedThread === tun2SocksThread) {
-                    mainHandler.post {
-                        if (tun2SocksThread === failedThread) {
-                            Log.e(TAG, "Tun2Socks worker: stopping VPN service after worker failure")
-                            stopServiceAfterFailure()
-                        }
-                    }
-                }
-            } finally {
-                dumpTun2SocksLog(tun2SocksLogFile, "worker-exit")
+                Thread.sleep(1000L * attempt)
+            } catch (exception: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
             }
-        }, "tun2socks-worker")
-
-        tun2SocksThread = worker
-        worker.start()
-        Log.d(TAG, "startTun2Socks: worker started")
-    }
-
-    private fun prepareTun2SocksLogFile(): File {
-        val logFile = File(cacheDir, TUN2SOCKS_LOG_FILE_NAME)
-        if (logFile.exists() && !logFile.delete()) {
-            Log.e(TAG, "prepareTun2SocksLogFile: failed to delete old log file=${logFile.absolutePath}")
         }
-        Log.d(TAG, "prepareTun2SocksLogFile: native log file=${logFile.absolutePath}")
-        return logFile
+        return false
     }
 
-    private fun buildTun2SocksConfig(config: ProxyConfig, logFile: File): String {
-        val authConfig = if (config.login.isEmpty() && config.password.isEmpty()) {
-            ""
-        } else {
-            """
-              username: '${yamlSingleQuoted(config.login)}'
-              password: '${yamlSingleQuoted(config.password)}'
-            """.trimEnd()
+    private fun writePdnsdConf() {
+        val dir = filesDir.absolutePath
+        val conf = PDNSD_CONF_TEMPLATE
+            .replace("{DIR}", dir)
+            .replace("{IP}", DNS_UPSTREAM)
+            .replace("{PORT}", DNS_UPSTREAM_PORT.toString())
+        File(filesDir, "pdnsd.conf").writeText(conf)
+        val cache = File(filesDir, "pdnsd.cache")
+        if (!cache.exists()) {
+            try {
+                cache.createNewFile()
+            } catch (exception: IOException) {
+                Log.e(TAG, "writePdnsdConf: failed to create pdnsd.cache", exception)
+            }
         }
-
-        return """
-            tunnel:
-              mtu: $TUN_MTU
-            socks5:
-              address: '${yamlSingleQuoted(config.ip)}'
-              port: ${config.port}
-              udp: 'tcp'
-$authConfig
-            mapdns:
-              address: '$MAPDNS_ADDRESS'
-              port: 53
-              network: '$MAPDNS_NETWORK'
-              netmask: '$MAPDNS_NETMASK'
-              cache-size: $MAPDNS_CACHE_SIZE
-            misc:
-              task-stack-size: 24576
-              connect-timeout: 10000
-              tcp-read-write-timeout: 300000
-              udp-read-write-timeout: 60000
-              log-file: '${yamlSingleQuoted(logFile.absolutePath)}'
-              log-level: info
-        """.trimIndent()
     }
 
-    private fun yamlSingleQuoted(value: String): String {
-        return value.replace("'", "''")
-    }
-
-    private fun parseAllowedPackage(rawAllowedPackage: String?): String? {
-        val allowedPackage = rawAllowedPackage?.trim()?.takeIf { it.isNotEmpty() }
-        if (allowedPackage == null) {
-            Log.d(TAG, "parseAllowedPackage: full-device VPN mode")
-        } else {
-            Log.d(TAG, "parseAllowedPackage: package-scoped VPN mode package=$allowedPackage")
+    private fun execAndWait(command: Array<String>): Int {
+        return try {
+            Runtime.getRuntime().exec(command).waitFor()
+        } catch (exception: Exception) {
+            Log.e(TAG, "execAndWait: failed to run ${command.firstOrNull()}", exception)
+            -1
         }
-        return allowedPackage
     }
 
-    private fun dumpTun2SocksLog(logFile: File, reason: String) {
-        if (!logFile.exists()) {
-            Log.d(TAG, "dumpTun2SocksLog: no native log for reason=$reason")
-            return
-        }
+    private fun stopTunnelProcesses() {
+        killPidFile(File(filesDir, "tun2socks.pid"))
+        killPidFile(File(filesDir, "pdnsd.pid"))
+    }
 
+    private fun killPidFile(file: File) {
+        if (!file.exists()) return
         try {
-            val lines = logFile.readLines().takeLast(TUN2SOCKS_LOG_TAIL_LINES)
-            if (lines.isEmpty()) {
-                Log.d(TAG, "dumpTun2SocksLog: native log is empty for reason=$reason")
-                return
+            val pid = file.readText().trim().toIntOrNull()
+            if (pid != null && pid > 0) {
+                Log.d(TAG, "killPidFile: killing pid=$pid from ${file.name}")
+                Runtime.getRuntime().exec(arrayOf("kill", pid.toString())).waitFor()
             }
-
-            Log.d(
-                TAG,
-                "dumpTun2SocksLog: last ${lines.size} native log lines for reason=$reason"
-            )
-            for (line in lines) {
-                Log.d(TAG, "tun2socks.log: $line")
-            }
-        } catch (exception: IOException) {
-            Log.e(TAG, "dumpTun2SocksLog: failed to read native log for reason=$reason", exception)
+        } catch (exception: Exception) {
+            Log.e(TAG, "killPidFile: failed for ${file.name}", exception)
+        } finally {
+            file.delete()
         }
     }
 
     private fun stopVpn() {
-        Log.d(TAG, "stopVpn: stopping tun2socks worker and closing VPN fd")
-
-        val worker = tun2SocksThread
-        tun2SocksThread = null
-        if (worker != null) {
-            Log.d(TAG, "stopVpn: requesting Tun2Socks.stop")
-            Tun2Socks.stop()
-            Log.d(TAG, "stopVpn: interrupting worker name=${worker.name} alive=${worker.isAlive}")
-            worker.interrupt()
-        } else {
-            Log.d(TAG, "stopVpn: no tun2socks worker to interrupt")
-        }
+        Log.d(TAG, "stopVpn: stopping tunnel processes and closing VPN fd")
+        stopTunnelProcesses()
 
         val descriptor = vpnFileDescriptor
         vpnFileDescriptor = null
         if (descriptor != null) {
+            // Close through ParcelFileDescriptor only. A raw close() on its fd
+            // (e.g. Native.jniclose) trips Android fdsan (double-close abort),
+            // since the fd is fdsan-tagged. tun2socks holds its own dup, so this
+            // only releases our copy; killing tun2socks releases the tunnel.
             try {
-                Log.d(TAG, "stopVpn: closing vpn fd=${descriptor.fd}")
                 descriptor.close()
             } catch (exception: IOException) {
                 Log.e(TAG, "stopVpn: failed to close VPN fd", exception)
@@ -715,11 +565,23 @@ $authConfig
         }
     }
 
-    private fun stopServiceAfterFailure() {
-        Log.d(TAG, "stopServiceAfterFailure: cleaning up after startup failure")
+    private fun stopServiceAfterFailure(reason: String? = null) {
+        Log.d(TAG, "stopServiceAfterFailure: cleaning up after startup failure reason=$reason")
+        broadcastState(STATE_ERROR, reason)
         stopVpn()
         stopForegroundCompat()
         stopSelf()
+    }
+
+    private fun broadcastState(state: String, detail: String? = null) {
+        currentState = state
+        currentStateDetail = detail
+        Log.d(TAG, "broadcastState: state=$state detail=$detail")
+        val intent = Intent(ACTION_STATE)
+            .setPackage(packageName)
+            .putExtra(EXTRA_STATE, state)
+            .putExtra(EXTRA_STATE_DETAIL, detail)
+        sendBroadcast(intent)
     }
 
     private fun parseProxyConfig(rawConfig: String?): ProxyConfig? {
@@ -757,6 +619,16 @@ $authConfig
                 "passwordLength=${password.length}"
         )
         return ProxyConfig(ip, port, login, password)
+    }
+
+    private fun parseAllowedPackage(rawAllowedPackage: String?): String? {
+        val allowedPackage = rawAllowedPackage?.trim()?.takeIf { it.isNotEmpty() }
+        if (allowedPackage == null) {
+            Log.d(TAG, "parseAllowedPackage: full-device VPN mode")
+        } else {
+            Log.d(TAG, "parseAllowedPackage: package-scoped VPN mode package=$allowedPackage")
+        }
+        return allowedPackage
     }
 
     private fun promoteToForeground(statusText: String) {
@@ -854,22 +726,30 @@ $authConfig
             get() = login.isNotEmpty() || password.isNotEmpty()
     }
 
-    private data class PreflightResult(
-        val success: Boolean,
-        val stage: String,
-        val message: String
-    ) {
-        companion object {
-            fun ok(stage: String, message: String) = PreflightResult(true, stage, message)
-            fun fail(stage: String, message: String) = PreflightResult(false, stage, message)
-        }
-    }
-
     companion object {
         const val ACTION_START = "com.proxy.START"
         const val ACTION_STOP = "com.proxy.STOP"
         const val EXTRA_CONFIG = "config"
         const val EXTRA_ALLOWED_PACKAGE = "allowedPackage"
+
+        // Optional BadVPN udpgw server "addr:port" for UDP relay. Without it UDP
+        // is not relayed (DNS still works via pdnsd). Kept for parity with
+        // SocksDroid; most commercial SOCKS5 proxies have no udpgw.
+        const val EXTRA_UDPGW = "udpgw"
+
+        // Lightweight state signalling for the optional on-device UI
+        // (MainActivity). Does not affect the headless ADB path.
+        const val ACTION_STATE = "com.proxy.STATE"
+        const val ACTION_QUERY_STATE = "com.proxy.QUERY_STATE"
+        const val EXTRA_STATE = "state"
+        const val EXTRA_STATE_DETAIL = "detail"
+        const val STATE_CONNECTING = "connecting"
+        const val STATE_CONNECTED = "connected"
+        const val STATE_STOPPED = "stopped"
+        const val STATE_ERROR = "error"
+        @Volatile internal var currentState: String = STATE_STOPPED
+        @Volatile internal var currentStateDetail: String? = null
+
         @Volatile internal var activeService: SocksVpnService? = null
 
         private const val TAG = "SocksVpnService"
@@ -877,68 +757,74 @@ $authConfig
         private const val NOTIFICATION_CHANNEL_ID = "socks5_vpn"
         private const val NOTIFICATION_ID = 1001
 
+        private const val LIB_TUN2SOCKS = "libtun2socks.so"
+        private const val LIB_PDNSD = "libpdnsd.so"
+
+        // TUN + tun2socks addressing (mirrors SocksDroid).
         private const val TUN_MTU = 1500
-        private const val TUN_IPV4_ADDRESS = "10.10.0.2"
-        private const val TUN_IPV4_PREFIX_LENGTH = 32
-        private const val TUN2SOCKS_LOG_FILE_NAME = "tun2socks.log"
-        private const val TUN2SOCKS_LOG_TAIL_LINES = 120
+        private const val TUN_ADDRESS = "26.26.26.1"
+        private const val TUN_PREFIX_LENGTH = 24
+        private const val TUN_NETIF_IPADDR = "26.26.26.2"
+        private const val TUN_NETIF_NETMASK = "255.255.255.0"
 
-        private const val MAPDNS_ADDRESS = "198.18.0.2"
-        private const val MAPDNS_NETWORK = "100.64.0.0"
-        private const val MAPDNS_NETMASK = "255.192.0.0"
-        private const val MAPDNS_CACHE_SIZE = 10000
+        // DNS: a stub server the system routes into the tun; tun2socks --dnsgw
+        // redirects it to pdnsd (listening on 26.26.26.1:8091) which resolves
+        // over TCP through the proxy/upstream.
+        private const val DNS_STUB = "8.8.8.8"
+        private const val DNSGW = "26.26.26.1:8091"
+        private const val DNS_UPSTREAM = "8.8.8.8"
+        private const val DNS_UPSTREAM_PORT = 53
 
-        private const val PREFLIGHT_CONNECT_TIMEOUT_MS = 30000
-        private const val PREFLIGHT_READ_TIMEOUT_MS = 30000
-        private const val PREFLIGHT_TARGET_HOST = "api.ipify.org"
-        private const val PREFLIGHT_TARGET_PORT = 80
+        private const val FD_SEND_ATTEMPTS = 5
+        private const val PROCESS_KILL_DELAY_MS = 400L
 
-        private const val SOCKS5_VERSION: Byte = 5
-        private const val SOCKS5_COMMAND_CONNECT: Byte = 1
-        private const val SOCKS5_METHOD_NO_AUTH: Byte = 0
-        private const val SOCKS5_METHOD_USER_PASS: Byte = 2
-        private const val SOCKS5_METHOD_NOT_ACCEPTABLE: Byte = -1
-        private const val SOCKS5_AUTH_VERSION: Byte = 1
-        private const val SOCKS5_AUTH_SUCCESS: Byte = 0
-        private const val SOCKS5_REPLY_SUCCESS: Byte = 0
-        private const val SOCKS5_ADDRESS_IPV4: Byte = 1
-        private const val SOCKS5_ADDRESS_DOMAIN: Byte = 3
-        private const val SOCKS5_ADDRESS_IPV6: Byte = 4
+        private val PDNSD_CONF_TEMPLATE = """
+            global {
+                perm_cache=1024;
+                cache_dir="{DIR}";
+                server_port = 8091;
+                server_ip = 0.0.0.0;
+                query_method=tcp_only;
+                min_ttl=15m;
+                max_ttl=1w;
+                timeout=10;
+                daemon=on;
+                pid_file="{DIR}/pdnsd.pid";
+            }
+
+            server {
+                label= "upstream";
+                ip = {IP};
+                port = {PORT};
+                uptest = none;
+            }
+
+            rr {
+                name=localhost;
+                reverse=on;
+                a=127.0.0.1;
+                owner=localhost;
+                soa=localhost,root.localhost,42,86400,900,86400,86400;
+            }
+        """.trimIndent()
     }
 }
 
-object Tun2Socks {
-    private const val TAG = "Tun2Socks"
-
+/**
+ * Tiny JNI helper (libsystem.so, from SocksDroid) for handing the TUN file
+ * descriptor to the tun2socks process over a unix socket, and closing it.
+ * The native library registers these against class com/proxy/Native.
+ */
+object Native {
     init {
-        System.loadLibrary("hev-socks5-tunnel")
-        System.loadLibrary("tun2socks_jni")
+        System.loadLibrary("system")
     }
 
-    fun start(vpnFileDescriptor: ParcelFileDescriptor, config: String) {
-        val result = nativeStart(config, vpnFileDescriptor.fd)
-        if (result != 0) {
-            throw IllegalStateException("hev_socks5_tunnel_main_from_str failed with code=$result")
-        }
-    }
+    external fun sendfd(fd: Int, sock: String): Int
 
-    fun stop() {
-        nativeStop()
-    }
-
+    // Unused by us (we close via ParcelFileDescriptor to stay fdsan-safe), but
+    // must stay declared: libsystem.so's JNI_OnLoad RegisterNatives binds both
+    // methods against com/proxy/Native, and a missing one fails library load.
     @Suppress("unused")
-    fun protectSocket(socketFd: Int): Boolean {
-        val service = SocksVpnService.activeService
-        if (service == null) {
-            Log.e(TAG, "protectSocket: no active VpnService for fd=$socketFd")
-            return false
-        }
-
-        val protected = service.protect(socketFd)
-        Log.d(TAG, "protectSocket: fd=$socketFd protected=$protected")
-        return protected
-    }
-
-    private external fun nativeStart(config: String, tunFd: Int): Int
-    private external fun nativeStop()
+    external fun jniclose(fd: Int)
 }
