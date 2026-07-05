@@ -9,7 +9,7 @@ void hev_socks5_tunnel_quit(void);
 void hev_socks5_set_protect_socket(int (*callback)(int fd));
 
 static JavaVM *global_vm = NULL;
-static jobject protect_object = NULL;
+static jclass protect_class = NULL;
 static jmethodID protect_method = NULL;
 
 JNIEXPORT jint JNICALL
@@ -20,7 +20,7 @@ JNI_OnLoad(JavaVM *vm, void *reserved) {
 }
 
 static int protect_socket_callback(int fd) {
-    if (global_vm == NULL || protect_object == NULL || protect_method == NULL) {
+    if (global_vm == NULL || protect_class == NULL || protect_method == NULL) {
         return -1;
     }
 
@@ -33,9 +33,9 @@ static int protect_socket_callback(int fd) {
         attached = 1;
     }
 
-    jboolean protected = (*env)->CallBooleanMethod(
+    jboolean protected = (*env)->CallStaticBooleanMethod(
         env,
-        protect_object,
+        protect_class,
         protect_method,
         (jint) fd
     );
@@ -65,30 +65,46 @@ Java_com_proxy_Tun2Socks_nativeStart(JNIEnv *env, jobject thiz, jstring config,
         return -ENOMEM;
     }
 
-    jobject local_protect_object = (*env)->NewGlobalRef(env, thiz);
-    if (local_protect_object == NULL) {
+    jclass local_protect_class_ref = (*env)->FindClass(env, "com/proxy/Tun2Socks");
+    if (local_protect_class_ref == NULL) {
+        (*env)->ReleaseStringUTFChars(env, config, config_chars);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        return -EINVAL;
+    }
+
+    jclass local_protect_class = (*env)->NewGlobalRef(env, local_protect_class_ref);
+    (*env)->DeleteLocalRef(env, local_protect_class_ref);
+    if (local_protect_class == NULL) {
         (*env)->ReleaseStringUTFChars(env, config, config_chars);
         return -ENOMEM;
     }
 
-    jclass protect_class = (*env)->GetObjectClass(env, thiz);
-    jmethodID local_protect_method = (*env)->GetMethodID(env, protect_class, "protectSocket", "(I)Z");
-    (*env)->DeleteLocalRef(env, protect_class);
+    jmethodID local_protect_method = (*env)->GetStaticMethodID(
+        env,
+        local_protect_class,
+        "protectSocket",
+        "(I)Z"
+    );
     if (local_protect_method == NULL) {
-        (*env)->DeleteGlobalRef(env, local_protect_object);
+        (*env)->DeleteGlobalRef(env, local_protect_class);
         (*env)->ReleaseStringUTFChars(env, config, config_chars);
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
         return -EINVAL;
     }
 
     int tunnel_fd = dup(tun_fd);
     if (tunnel_fd < 0) {
         int error = errno;
-        (*env)->DeleteGlobalRef(env, local_protect_object);
+        (*env)->DeleteGlobalRef(env, local_protect_class);
         (*env)->ReleaseStringUTFChars(env, config, config_chars);
         return -error;
     }
 
-    protect_object = local_protect_object;
+    protect_class = local_protect_class;
     protect_method = local_protect_method;
     hev_socks5_set_protect_socket(protect_socket_callback);
 
@@ -100,8 +116,8 @@ Java_com_proxy_Tun2Socks_nativeStart(JNIEnv *env, jobject thiz, jstring config,
 
     hev_socks5_set_protect_socket(NULL);
     protect_method = NULL;
-    protect_object = NULL;
-    (*env)->DeleteGlobalRef(env, local_protect_object);
+    protect_class = NULL;
+    (*env)->DeleteGlobalRef(env, local_protect_class);
 
     close(tunnel_fd);
     (*env)->ReleaseStringUTFChars(env, config, config_chars);

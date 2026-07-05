@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -20,6 +21,9 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class AdbCommandReceiver : BroadcastReceiver() {
@@ -193,6 +197,8 @@ class SocksVpnService : VpnService() {
     private var vpnFileDescriptor: ParcelFileDescriptor? = null
     @Volatile private var tun2SocksThread: Thread? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val protectThread = HandlerThread("socks-vpn-protect").apply { start() }
+    private val protectHandler = Handler(protectThread.looper)
     private val startGeneration = AtomicInteger(0)
 
     override fun onCreate() {
@@ -240,6 +246,7 @@ class SocksVpnService : VpnService() {
         if (activeService === this) {
             activeService = null
         }
+        protectThread.quitSafely()
         super.onDestroy()
     }
 
@@ -736,6 +743,56 @@ $authConfig
         stopSelf()
     }
 
+    internal fun protectSocketFromNative(socketFd: Int): Boolean {
+        if (socketFd < 0) {
+            Log.e(TAG, "protectSocketFromNative: invalid fd=$socketFd")
+            return false
+        }
+
+        if (Looper.myLooper() == protectHandler.looper) {
+            return protectSocketDirect(socketFd)
+        }
+
+        val result = AtomicBoolean(false)
+        val completed = CountDownLatch(1)
+        val posted = protectHandler.post {
+            try {
+                result.set(protectSocketDirect(socketFd))
+            } finally {
+                completed.countDown()
+            }
+        }
+
+        if (!posted) {
+            Log.e(TAG, "protectSocketFromNative: failed to post protect request fd=$socketFd")
+            return false
+        }
+
+        return try {
+            if (!completed.await(PROTECT_SOCKET_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                Log.e(TAG, "protectSocketFromNative: protect request timed out fd=$socketFd")
+                false
+            } else {
+                result.get()
+            }
+        } catch (exception: InterruptedException) {
+            Thread.currentThread().interrupt()
+            Log.e(TAG, "protectSocketFromNative: interrupted while waiting fd=$socketFd", exception)
+            false
+        }
+    }
+
+    private fun protectSocketDirect(socketFd: Int): Boolean {
+        return try {
+            val protected = protect(socketFd)
+            Log.d(TAG, "protectSocketDirect: fd=$socketFd protected=$protected")
+            protected
+        } catch (throwable: Throwable) {
+            Log.e(TAG, "protectSocketDirect: failed to protect fd=$socketFd", throwable)
+            false
+        }
+    }
+
     private fun parseProxyConfig(rawConfig: String?, udpMode: String): ProxyConfig? {
         Log.d(TAG, "parseProxyConfig: raw config extra=${redactConfig(rawConfig)}")
 
@@ -930,6 +987,7 @@ $authConfig
         private const val DEFAULT_UDP_MODE = "udp"
         private val ALLOWED_UDP_MODES = setOf("udp", "tcp")
         private const val WORKER_JOIN_TIMEOUT_MS = 3000L
+        private const val PROTECT_SOCKET_TIMEOUT_MS = 5000L
 
         private const val MAPDNS_ADDRESS = "198.18.0.2"
         private const val MAPDNS_NETWORK = "100.64.0.0"
@@ -974,6 +1032,7 @@ object Tun2Socks {
         nativeStop()
     }
 
+    @JvmStatic
     @Suppress("unused")
     fun protectSocket(socketFd: Int): Boolean {
         val service = SocksVpnService.activeService
@@ -982,9 +1041,7 @@ object Tun2Socks {
             return false
         }
 
-        val protected = service.protect(socketFd)
-        Log.d(TAG, "protectSocket: fd=$socketFd protected=$protected")
-        return protected
+        return service.protectSocketFromNative(socketFd)
     }
 
     private external fun nativeStart(config: String, tunFd: Int): Int
