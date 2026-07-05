@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
@@ -14,6 +15,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.util.Log
 import java.io.EOFException
 import java.io.File
@@ -201,11 +203,23 @@ class SocksVpnService : VpnService() {
     private val protectHandler = Handler(protectThread.looper)
     private val startGeneration = AtomicInteger(0)
 
+    // Answers a QUERY_STATE from the UI (which lives in a different process and
+    // cannot read our static state) by re-broadcasting the current state.
+    private val queryStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == ACTION_QUERY_STATE) {
+                Log.d(TAG, "queryStateReceiver: re-broadcasting state=$currentState")
+                broadcastState(currentState, currentStateDetail)
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         activeService = this
         Log.d(TAG, "onCreate: service created")
         createNotificationChannel()
+        registerQueryStateReceiver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -221,6 +235,7 @@ class SocksVpnService : VpnService() {
 
         return when (intent.action) {
             ACTION_START -> {
+                cancelTunnelProcessKill()
                 val started = handleStartIntent(intent)
                 if (started) START_REDELIVER_INTENT else START_NOT_STICKY
             }
@@ -228,8 +243,10 @@ class SocksVpnService : VpnService() {
                 Log.d(TAG, "onStartCommand: STOP action received")
                 startGeneration.incrementAndGet()
                 stopVpn()
+                broadcastState(STATE_STOPPED)
                 stopForegroundCompat()
                 stopSelf()
+                scheduleTunnelProcessKill()
                 START_NOT_STICKY
             }
             else -> {
@@ -246,14 +263,57 @@ class SocksVpnService : VpnService() {
         if (activeService === this) {
             activeService = null
         }
+        try {
+            unregisterReceiver(queryStateReceiver)
+        } catch (_: IllegalArgumentException) {
+            // Not registered; ignore.
+        }
         protectThread.quitSafely()
         super.onDestroy()
+    }
+
+    private fun registerQueryStateReceiver() {
+        val filter = IntentFilter(ACTION_QUERY_STATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(queryStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(queryStateReceiver, filter)
+        }
     }
 
     override fun onRevoke() {
         Log.e(TAG, "onRevoke: VPN permission revoked by the system or user")
         stopVpn()
+        broadcastState(STATE_STOPPED, "VPN revoked")
+        scheduleTunnelProcessKill()
         super.onRevoke()
+    }
+
+    /**
+     * The tunnel runs in its own ":tunnel" process (see manifest). After a
+     * user-initiated teardown we kill that process so the next START comes up in
+     * a fresh process with clean global lwip state. hev-socks5-tunnel keeps
+     * process-global lwip state (netif etc.); re-running it in the same process
+     * races the previous tunnel's teardown and aborts in netif_add under load.
+     * Killing on STOP sidesteps that entirely. The UI lives in the main process
+     * and is unaffected. Delayed slightly so the STATE broadcast and foreground
+     * notification removal are dispatched first.
+     */
+    private val killProcessRunnable = Runnable {
+        Log.d(TAG, "killProcessRunnable: killing :tunnel process pid=${Process.myPid()}")
+        Process.killProcess(Process.myPid())
+    }
+
+    private fun scheduleTunnelProcessKill() {
+        mainHandler.removeCallbacks(killProcessRunnable)
+        mainHandler.postDelayed(killProcessRunnable, PROCESS_KILL_DELAY_MS)
+    }
+
+    private fun cancelTunnelProcessKill() {
+        // A new START arrived before the delayed kill fired (rapid reconnect in
+        // the same process). Do not kill a process that is now connecting.
+        mainHandler.removeCallbacks(killProcessRunnable)
     }
 
     private fun handleStartIntent(intent: Intent): Boolean {
@@ -282,6 +342,7 @@ class SocksVpnService : VpnService() {
         val allowedPackage = parseAllowedPackage(intent.getStringExtra(EXTRA_ALLOWED_PACKAGE))
         val generation = startGeneration.incrementAndGet()
         promoteToForeground("Checking SOCKS5 proxy")
+        broadcastState(STATE_CONNECTING, "checking ${proxyConfig.ip}:${proxyConfig.port}")
         runPreflightThenStart(proxyConfig, allowedPackage, generation)
         return true
     }
@@ -309,7 +370,7 @@ class SocksVpnService : VpnService() {
                         "runPreflightThenStart: SOCKS5 preflight failed " +
                             "stage=${result.stage} message=${result.message}"
                     )
-                    stopServiceAfterFailure()
+                    stopServiceAfterFailure("preflight ${result.stage}: ${result.message}")
                     return@post
                 }
 
@@ -337,11 +398,12 @@ class SocksVpnService : VpnService() {
 
             startTun2Socks(tunInterface, proxyConfig)
             promoteToForeground("Connected to ${proxyConfig.ip}:${proxyConfig.port}")
+            broadcastState(STATE_CONNECTED, "${proxyConfig.ip}:${proxyConfig.port}")
 
             Log.d(TAG, "startVpnAfterPreflight: SOCKS5 VPN startup completed")
         } catch (throwable: Throwable) {
             Log.e(TAG, "startVpnAfterPreflight: failed to start VPN", throwable)
-            stopServiceAfterFailure()
+            stopServiceAfterFailure(throwable.message ?: "failed to start VPN")
         }
     }
 
@@ -736,11 +798,23 @@ $authConfig
         }
     }
 
-    private fun stopServiceAfterFailure() {
-        Log.d(TAG, "stopServiceAfterFailure: cleaning up after startup failure")
+    private fun stopServiceAfterFailure(reason: String? = null) {
+        Log.d(TAG, "stopServiceAfterFailure: cleaning up after startup failure reason=$reason")
+        broadcastState(STATE_ERROR, reason)
         stopVpn()
         stopForegroundCompat()
         stopSelf()
+    }
+
+    private fun broadcastState(state: String, detail: String? = null) {
+        currentState = state
+        currentStateDetail = detail
+        Log.d(TAG, "broadcastState: state=$state detail=$detail")
+        val intent = Intent(ACTION_STATE)
+            .setPackage(packageName)
+            .putExtra(EXTRA_STATE, state)
+            .putExtra(EXTRA_STATE_DETAIL, detail)
+        sendBroadcast(intent)
     }
 
     internal fun protectSocketFromNative(socketFd: Int): Boolean {
@@ -965,6 +1039,20 @@ $authConfig
         const val EXTRA_CONFIG = "config"
         const val EXTRA_ALLOWED_PACKAGE = "allowedPackage"
         const val EXTRA_UDP_MODE = "udp"
+
+        // Lightweight state signalling for the optional on-device UI
+        // (MainActivity). Does not affect the headless ADB path.
+        const val ACTION_STATE = "com.proxy.STATE"
+        const val ACTION_QUERY_STATE = "com.proxy.QUERY_STATE"
+        const val EXTRA_STATE = "state"
+        const val EXTRA_STATE_DETAIL = "detail"
+        const val STATE_CONNECTING = "connecting"
+        const val STATE_CONNECTED = "connected"
+        const val STATE_STOPPED = "stopped"
+        const val STATE_ERROR = "error"
+        @Volatile internal var currentState: String = STATE_STOPPED
+        @Volatile internal var currentStateDetail: String? = null
+
         @Volatile internal var activeService: SocksVpnService? = null
 
         private const val TAG = "SocksVpnService"
@@ -984,10 +1072,11 @@ $authConfig
         //   'tcp' -> hev's non-standard UDP-in-TCP (only hev-socks5-server).
         // Default is 'udp' so ordinary commercial SOCKS5 proxies do not receive
         // non-standard framing and reset the whole connection.
-        private const val DEFAULT_UDP_MODE = "udp"
+        const val DEFAULT_UDP_MODE = "udp"
         private val ALLOWED_UDP_MODES = setOf("udp", "tcp")
         private const val WORKER_JOIN_TIMEOUT_MS = 3000L
         private const val PROTECT_SOCKET_TIMEOUT_MS = 5000L
+        private const val PROCESS_KILL_DELAY_MS = 400L
 
         private const val MAPDNS_ADDRESS = "198.18.0.2"
         private const val MAPDNS_NETWORK = "100.64.0.0"
