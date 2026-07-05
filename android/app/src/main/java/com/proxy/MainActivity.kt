@@ -24,7 +24,6 @@ import android.widget.CompoundButton
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 
@@ -43,13 +42,11 @@ class MainActivity : Activity() {
     private lateinit var portField: EditText
     private lateinit var loginField: EditText
     private lateinit var passwordField: EditText
-    private lateinit var udpTcpSwitch: Switch
     private lateinit var statusView: TextView
     private lateinit var connectButton: Button
     private lateinit var disconnectButton: Button
 
     private var pendingConfig: String? = null
-    private var pendingUdpMode: String = SocksVpnService.DEFAULT_UDP_MODE
 
     private val prefs by lazy { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
 
@@ -129,13 +126,6 @@ class MainActivity : Activity() {
         }
         root.addView(showPassword)
 
-        udpTcpSwitch = Switch(this).apply {
-            text = "UDP-in-TCP (только hev-socks5-server)"
-            layoutParams = marginParams(top = dp(12))
-        }
-        root.addView(udpTcpSwitch)
-        root.addView(hintLabel("Выкл = стандартный UDP ASSOCIATE (для обычных SOCKS5). Вкл = нестандартный UDP-in-TCP."))
-
         connectButton = Button(this).apply {
             text = "Подключить"
             layoutParams = marginParams(top = dp(20))
@@ -182,11 +172,9 @@ class MainActivity : Activity() {
         }
 
         val config = "$ip|$port|$login|$password"
-        val udpMode = if (udpTcpSwitch.isChecked) "tcp" else "udp"
-        saveConfig(ip, port, login, password, udpTcpSwitch.isChecked)
+        saveConfig(ip, port, login, password)
 
         pendingConfig = config
-        pendingUdpMode = udpMode
 
         val consent = VpnService.prepare(this)
         if (consent != null) {
@@ -194,7 +182,7 @@ class MainActivity : Activity() {
             renderState(SocksVpnService.STATE_CONNECTING, "запрос разрешения VPN")
             startActivityForResult(consent, REQUEST_VPN_CONSENT)
         } else {
-            startVpn(config, udpMode)
+            startVpn(config)
         }
     }
 
@@ -206,7 +194,7 @@ class MainActivity : Activity() {
         if (resultCode == RESULT_OK) {
             val config = pendingConfig
             if (config != null) {
-                startVpn(config, pendingUdpMode)
+                startVpn(config)
             }
         } else {
             Log.e(TAG, "onActivityResult: VPN consent denied")
@@ -214,15 +202,14 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startVpn(config: String, udpMode: String) {
-        Log.d(TAG, "startVpn: launching SocksVpnService udpMode=$udpMode")
+    private fun startVpn(config: String) {
+        Log.d(TAG, "startVpn: launching SocksVpnService")
         val intent = Intent(this, SocksVpnService::class.java).apply {
             action = SocksVpnService.ACTION_START
             putExtra(SocksVpnService.EXTRA_CONFIG, config)
-            putExtra(SocksVpnService.EXTRA_UDP_MODE, udpMode)
         }
         startForegroundService(intent)
-        renderState(SocksVpnService.STATE_CONNECTING, "проверка прокси")
+        renderState(SocksVpnService.STATE_CONNECTING, "подключение")
     }
 
     private fun onDisconnectClicked() {
@@ -255,16 +242,14 @@ class MainActivity : Activity() {
         portField.setText(if (port in 1..65535) port.toString() else "")
         loginField.setText(prefs.getString(KEY_LOGIN, ""))
         passwordField.setText(prefs.getString(KEY_PASSWORD, ""))
-        udpTcpSwitch.isChecked = prefs.getBoolean(KEY_UDP_TCP, false)
     }
 
-    private fun saveConfig(ip: String, port: Int, login: String, password: String, udpTcp: Boolean) {
+    private fun saveConfig(ip: String, port: Int, login: String, password: String) {
         prefs.edit()
             .putString(KEY_IP, ip)
             .putInt(KEY_PORT, port)
             .putString(KEY_LOGIN, login)
             .putString(KEY_PASSWORD, password)
-            .putBoolean(KEY_UDP_TCP, udpTcp)
             .apply()
     }
 
@@ -326,6 +311,5 @@ class MainActivity : Activity() {
         private const val KEY_PORT = "port"
         private const val KEY_LOGIN = "login"
         private const val KEY_PASSWORD = "password"
-        private const val KEY_UDP_TCP = "udp_tcp"
     }
 }

@@ -1,6 +1,6 @@
 # Android APK
 
-Headless Android app launched through ADB. This directory owns the Android Gradle project, APK module, `VpnService`, ADB command bridge, and native `hev-socks5-tunnel` integration.
+Headless Android app launched through ADB (with an optional on-device UI). This directory owns the Android Gradle project, APK module, `VpnService`, ADB command bridge, and the native tunnel engine (BadVPN `tun2socks` + `pdnsd`, SocksDroid model).
 
 Minimum supported Android version: Android 12 (`minSdk 31`).
 
