@@ -100,6 +100,53 @@ function Patch-JniClassName {
     Write-Step "repointed system.cpp JNI class to $jniClassNew"
 }
 
+function Replace-Checked([string] $Path, [string] $Old, [string] $New, [string] $Desc) {
+    $content = Get-Content -LiteralPath $Path -Raw
+    if ($content.Contains($New)) {
+        Write-Step "already patched: $Desc"
+        return
+    }
+    if (-not $content.Contains($Old)) {
+        throw "patch target not found ($Desc) in $Path"
+    }
+    $content = $content.Replace($Old, $New)
+    Set-Content -LiteralPath $Path -Value $content -NoNewline
+    Write-Step "patched: $Desc"
+}
+
+function Patch-Tun2SocksUdp {
+    $jni = Join-Path $sourceRoot $jniRootRel
+
+    # 1) Enable the ANDROID_UDP code path (SOCKS5-UDP datagrams) for tun2socks.
+    Replace-Checked (Join-Path $jni "Android.mk") `
+        "LOCAL_CFLAGS += -DNDEBUG -DANDROID" `
+        "LOCAL_CFLAGS += -DNDEBUG -DANDROID -DANDROID_UDP" `
+        "Android.mk: -DANDROID_UDP"
+
+    # 2) Point the ANDROID_UDP UDP datagrams at our local bridge
+    #    (remote_udpgw_addr) instead of straight at the SOCKS server.
+    $sug = Join-Path $jni "badvpn\tun2socks\SocksUdpGwClient.c"
+    Replace-Checked $sug `
+        "BDatagram_Init(&o->udp_dgram, client->socks_server_addr.type" `
+        "BDatagram_Init(&o->udp_dgram, client->remote_udpgw_addr.type" `
+        "SocksUdpGwClient.c: BDatagram_Init family"
+    Replace-Checked $sug `
+        "ipaddr.type = client->socks_server_addr.type;" `
+        "ipaddr.type = client->remote_udpgw_addr.type;" `
+        "SocksUdpGwClient.c: ipaddr.type"
+    Replace-Checked $sug `
+        "BDatagram_SetSendAddrs(&o->udp_dgram, client->socks_server_addr, ipaddr);" `
+        "BDatagram_SetSendAddrs(&o->udp_dgram, client->remote_udpgw_addr, ipaddr);" `
+        "SocksUdpGwClient.c: send addr"
+
+    # 3) Make --enable-udprelay take the bridge address as an argument
+    #    (single-line anchor to avoid CRLF/LF matching issues).
+    Replace-Checked (Join-Path $jni "badvpn\tun2socks\tun2socks.c") `
+        "options.udpgw_remote_server_addr = `"0.0.0.0:0`";" `
+        "if (1 >= argc - i) { fprintf(stderr, `"%s: requires an argument\n`", arg); return 0; } options.udpgw_remote_server_addr = argv[i + 1]; i++;" `
+        "tun2socks.c: --enable-udprelay takes an address"
+}
+
 function Build-Abi([string] $NdkBuild, [string] $TargetAbi) {
     $projDir = Join-Path $sourceRoot "app\src\main"
     $projShort = Get-ShortPath $projDir
@@ -168,6 +215,7 @@ Write-Step "abi:  $($Abi -join ', ')"
 
 Ensure-SocksDroidSource
 Patch-JniClassName
+Patch-Tun2SocksUdp
 
 foreach ($targetAbi in $Abi) {
     Build-Abi -NdkBuild $ndkBuild -TargetAbi $targetAbi

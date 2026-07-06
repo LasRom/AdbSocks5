@@ -196,6 +196,7 @@ class AdbCommandService : Service() {
 class SocksVpnService : VpnService() {
 
     @Volatile private var vpnFileDescriptor: ParcelFileDescriptor? = null
+    @Volatile private var udpgwBridge: UdpgwSocks5Bridge? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val startGeneration = AtomicInteger(0)
 
@@ -332,19 +333,17 @@ class SocksVpnService : VpnService() {
         }
 
         val allowedPackage = parseAllowedPackage(intent.getStringExtra(EXTRA_ALLOWED_PACKAGE))
-        val udpgw = intent.getStringExtra(EXTRA_UDPGW)?.trim()?.takeIf { it.isNotEmpty() }
         val generation = startGeneration.incrementAndGet()
 
         promoteToForeground("Connecting to ${proxyConfig.ip}:${proxyConfig.port}")
         broadcastState(STATE_CONNECTING, "${proxyConfig.ip}:${proxyConfig.port}")
-        startTunnel(proxyConfig, allowedPackage, udpgw, generation)
+        startTunnel(proxyConfig, allowedPackage, generation)
         return true
     }
 
     private fun startTunnel(
         config: ProxyConfig,
         allowedPackage: String?,
-        udpgw: String?,
         generation: Int
     ) {
         // Off the main thread: establish + exec daemons + hand over the tun fd
@@ -376,7 +375,8 @@ class SocksVpnService : VpnService() {
 
                 writePdnsdConf()
                 startPdnsd()
-                val rc = startTun2Socks(config, fd, udpgw)
+                val udpgwPort = startUdpgwBridge(config)
+                val rc = startTun2Socks(config, fd, udpgwPort)
                 if (rc != 0) {
                     throw IOException("tun2socks exec returned $rc")
                 }
@@ -456,7 +456,7 @@ class SocksVpnService : VpnService() {
         Log.d(TAG, "startPdnsd: exit=$rc")
     }
 
-    private fun startTun2Socks(config: ProxyConfig, fd: Int, udpgw: String?): Int {
+    private fun startTun2Socks(config: ProxyConfig, fd: Int, udpgwPort: Int): Int {
         val command = ArrayList<String>()
         command.add("${applicationInfo.nativeLibraryDir}/$LIB_TUN2SOCKS")
         command.add("--netif-ipaddr"); command.add(TUN_NETIF_IPADDR)
@@ -472,12 +472,36 @@ class SocksVpnService : VpnService() {
             command.add("--password"); command.add(config.password)
         }
         command.add("--dnsgw"); command.add(DNSGW)
-        if (udpgw != null) {
-            command.add("--udpgw-remote-server-addr"); command.add(udpgw)
+        if (udpgwPort > 0) {
+            // -DANDROID_UDP tun2socks: --enable-udprelay <addr> sends SOCKS5-UDP
+            // datagrams to our local bridge, which relays them through the
+            // proxy's SOCKS5 UDP ASSOCIATE.
+            command.add("--enable-udprelay"); command.add("127.0.0.1:$udpgwPort")
         }
 
-        Log.d(TAG, "startTun2Socks: launching tun2socks (server=${config.ip}:${config.port} auth=${config.hasAuth})")
+        Log.d(TAG, "startTun2Socks: launching tun2socks (server=${config.ip}:${config.port} auth=${config.hasAuth} udpgwPort=$udpgwPort)")
         return execAndWait(command.toTypedArray())
+    }
+
+    private fun startUdpgwBridge(config: ProxyConfig): Int {
+        stopUdpgwBridge()
+        val bridge = UdpgwSocks5Bridge(config.ip, config.port, config.login, config.password)
+        val port = bridge.start()
+        if (port > 0) {
+            udpgwBridge = bridge
+            Log.d(TAG, "startUdpgwBridge: udpgw->SOCKS5 UDP bridge on 127.0.0.1:$port")
+        } else {
+            Log.e(TAG, "startUdpgwBridge: bridge failed to start; UDP will not be relayed")
+        }
+        return port
+    }
+
+    private fun stopUdpgwBridge() {
+        udpgwBridge?.let {
+            Log.d(TAG, "stopUdpgwBridge: stopping udpgw bridge")
+            it.stop()
+        }
+        udpgwBridge = null
     }
 
     private fun sendTunFd(fd: Int): Boolean {
@@ -546,6 +570,7 @@ class SocksVpnService : VpnService() {
 
     private fun stopVpn() {
         Log.d(TAG, "stopVpn: stopping tunnel processes and closing VPN fd")
+        stopUdpgwBridge()
         stopTunnelProcesses()
 
         val descriptor = vpnFileDescriptor
@@ -732,10 +757,8 @@ class SocksVpnService : VpnService() {
         const val EXTRA_CONFIG = "config"
         const val EXTRA_ALLOWED_PACKAGE = "allowedPackage"
 
-        // Optional BadVPN udpgw server "addr:port" for UDP relay. Without it UDP
-        // is not relayed (DNS still works via pdnsd). Kept for parity with
-        // SocksDroid; most commercial SOCKS5 proxies have no udpgw.
-        const val EXTRA_UDPGW = "udpgw"
+        // UDP is relayed through the proxy's SOCKS5 UDP ASSOCIATE by a local
+        // udpgw bridge (UdpgwSocks5Bridge); no external udpgw server needed.
 
         // Lightweight state signalling for the optional on-device UI
         // (MainActivity). Does not affect the headless ADB path.
