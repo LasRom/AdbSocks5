@@ -22,7 +22,7 @@ log = logging.getLogger("adbsocks5.apk")
 
 PACKAGE_NAME = "com.proxy"
 GITHUB_REPO = "LasRom/AdbSocks5"
-DEFAULT_VERSION = "v0.1.0"
+DEFAULT_VERSION = "v1.0.0"
 DEFAULT_APK_URL = (
     f"https://github.com/{GITHUB_REPO}/releases/download/"
     f"{DEFAULT_VERSION}/app-release.apk"

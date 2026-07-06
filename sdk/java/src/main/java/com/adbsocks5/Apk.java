@@ -26,7 +26,7 @@ public final class Apk {
 
     public static final String PACKAGE_NAME = "com.proxy";
     public static final String GITHUB_REPO = "LasRom/AdbSocks5";
-    public static final String DEFAULT_VERSION = "v0.1.0";
+    public static final String DEFAULT_VERSION = "v1.0.0";
     public static final String DEFAULT_APK_URL =
             "https://github.com/" + GITHUB_REPO + "/releases/download/"
                     + DEFAULT_VERSION + "/app-release.apk";

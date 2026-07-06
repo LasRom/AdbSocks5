@@ -30,7 +30,7 @@ from .errors import (
 )
 from .proxy import ProxyConfig
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "AdbSocks5Client",

@@ -94,7 +94,7 @@ If only one device is connected, `--serial` may be omitted.
 ## APK source
 
 By default the SDK downloads the pinned release asset
-(`app-release.apk` from GitHub release `v0.1.0`) and caches it under a per-user
+(`app-release.apk` from GitHub release `v1.0.0`) and caches it under a per-user
 cache directory (override with `ADBSOCKS5_CACHE_DIR`). Use `use_latest=True`
 (or `--latest`) to resolve the newest GitHub release instead, or pass
 `apk_path=` / `--apk` to install a local file with no network access.

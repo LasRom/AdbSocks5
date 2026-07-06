@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adbsocks5"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python SDK to route an ADB-connected Android device through a SOCKS5 proxy via the headless ADB SOCKS5 VPN app."
 readme = "README.md"
 requires-python = ">=3.8"
