@@ -7,6 +7,7 @@ the SDK lets the caller choose *which* connected device the proxy is applied to.
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import List, Optional
@@ -167,6 +168,15 @@ class Adb:
             if line.strip() == f"package:{package}":
                 return True
         return False
+
+    def package_version_code(self, package: str) -> Optional[int]:
+        """Return the installed ``versionCode`` of ``package``, or ``None`` if
+        the package is not installed."""
+        if not self.is_package_installed(package):
+            return None
+        out = self.shell(f"dumpsys package {package}", check=False)
+        match = re.search(r"versionCode=(\d+)", out)
+        return int(match.group(1)) if match else None
 
     def install(self, apk_path: str, reinstall: bool = True) -> None:
         """Install (or reinstall) an APK from a host path."""

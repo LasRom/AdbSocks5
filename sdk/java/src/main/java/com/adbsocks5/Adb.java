@@ -9,6 +9,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Thin wrapper around the {@code adb} command-line tool.
@@ -227,6 +229,19 @@ public final class Adb {
             }
         }
         return false;
+    }
+
+    /** The installed {@code versionCode} of {@code pkg}, or -1 if not installed. */
+    public int packageVersionCode(String pkg) throws AdbSocks5Exception {
+        if (!isPackageInstalled(pkg)) {
+            return -1;
+        }
+        String out = shell("dumpsys package " + pkg, false);
+        Matcher m = Pattern.compile("versionCode=(\\d+)").matcher(out);
+        if (m.find()) {
+            return Integer.parseInt(m.group(1));
+        }
+        return -1;
     }
 
     /** Install (or reinstall) an APK from a host path. */

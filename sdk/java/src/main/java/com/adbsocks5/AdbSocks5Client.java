@@ -102,18 +102,28 @@ public final class AdbSocks5Client {
     }
 
     /**
-     * Install the app only if it is missing.
+     * Install the app if missing, or upgrade it if the installed build is older
+     * than the SDK's target ({@link Apk#TARGET_VERSION_CODE}).
      *
-     * @return true if an installation was performed, false if already present
+     * @return true if an install or upgrade was performed, false if the app was
+     *     already present and up to date
      */
     public boolean ensureInstalled(boolean useLatest) throws AdbSocks5Exception {
-        if (isInstalled()) {
-            LOG.fine("app already installed on " + serial());
-            return false;
+        resolveDevice();
+        int installed = adb.packageVersionCode(PACKAGE);
+        if (installed < 0) {
+            LOG.info("app not installed on " + serial() + ", installing");
+            install(false, useLatest);
+            return true;
         }
-        LOG.info("app not installed on " + serial() + ", installing");
-        install(false, useLatest);
-        return true;
+        if (installed < Apk.TARGET_VERSION_CODE) {
+            LOG.info("app on " + serial() + " is versionCode " + installed
+                    + " (< " + Apk.TARGET_VERSION_CODE + "), upgrading");
+            install(false, useLatest);
+            return true;
+        }
+        LOG.fine("app up to date on " + serial() + " (versionCode " + installed + ")");
+        return false;
     }
 
     // -- permission --------------------------------------------------------

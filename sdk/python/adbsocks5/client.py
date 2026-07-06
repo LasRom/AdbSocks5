@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .adb import Adb, Device
-from .apk import DEFAULT_APK_URL, PACKAGE_NAME, resolve_apk
+from .apk import DEFAULT_APK_URL, PACKAGE_NAME, TARGET_VERSION_CODE, resolve_apk
 from .errors import VpnError
 from .proxy import ProxyConfig
 
@@ -112,17 +112,31 @@ class AdbSocks5Client:
         return path
 
     def ensure_installed(self, use_latest: bool = False) -> bool:
-        """Install the app only if it is missing.
+        """Install the app if missing, or upgrade it if the installed build is
+        older than the SDK's target (:data:`~adbsocks5.apk.TARGET_VERSION_CODE`).
 
-        Returns ``True`` if an installation was performed, ``False`` if the app
-        was already present.
+        Returns ``True`` if an install or upgrade was performed, ``False`` if the
+        app was already present and up to date.
         """
-        if self.is_installed():
-            log.debug("app already installed on %s", self.serial)
-            return False
-        log.info("app not installed on %s, installing", self.serial)
-        self.install(use_latest=use_latest)
-        return True
+        self.resolve_device()
+        installed = self.adb.package_version_code(self.PACKAGE)
+        if installed is None:
+            log.info("app not installed on %s, installing", self.serial)
+            self.install(use_latest=use_latest)
+            return True
+        if installed < TARGET_VERSION_CODE:
+            log.info(
+                "app on %s is versionCode %d (< %d), upgrading",
+                self.serial,
+                installed,
+                TARGET_VERSION_CODE,
+            )
+            self.install(use_latest=use_latest)
+            return True
+        log.debug(
+            "app up to date on %s (versionCode %d)", self.serial, installed
+        )
+        return False
 
     # -- permission --------------------------------------------------------
 

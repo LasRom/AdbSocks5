@@ -23,6 +23,9 @@ log = logging.getLogger("adbsocks5.apk")
 PACKAGE_NAME = "com.proxy"
 GITHUB_REPO = "LasRom/AdbSocks5"
 DEFAULT_VERSION = "v1.0.0"
+# versionCode of the pinned APK release (app.versionCode in the APK). Used to
+# auto-upgrade devices still running an older build than the SDK targets.
+TARGET_VERSION_CODE = 2
 DEFAULT_APK_URL = (
     f"https://github.com/{GITHUB_REPO}/releases/download/"
     f"{DEFAULT_VERSION}/app-release.apk"

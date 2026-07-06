@@ -27,6 +27,8 @@ public final class Apk {
     public static final String PACKAGE_NAME = "com.proxy";
     public static final String GITHUB_REPO = "LasRom/AdbSocks5";
     public static final String DEFAULT_VERSION = "v1.0.0";
+    /** versionCode of the pinned APK release; devices on an older build are upgraded. */
+    public static final int TARGET_VERSION_CODE = 2;
     public static final String DEFAULT_APK_URL =
             "https://github.com/" + GITHUB_REPO + "/releases/download/"
                     + DEFAULT_VERSION + "/app-release.apk";
